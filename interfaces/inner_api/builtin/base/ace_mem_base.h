@@ -29,9 +29,9 @@ inline uint32_t GetLR()
     __asm volatile ("mv %0, ra" : "=r" (lr));
     return lr;
 #elif (defined(__arm__) || defined(__aarch64__)) && !defined(__APPLE__)
-    uint32_t lr;
+    uintptr_t lr;
     __asm volatile ("mov %0, LR" : "=r" (lr));
-    return lr;
+    return static_cast<uint32_t>(lr);
 #else
     return static_cast<uint32_t>(0);
 #endif
