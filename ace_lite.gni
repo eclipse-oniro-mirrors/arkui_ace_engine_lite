@@ -13,6 +13,20 @@
 
 import("//build/lite/config/subsystem/aafwk/path.gni")
 
+declare_args() {
+  # When ON the engine defines GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT and compiles
+  # the flex layout enhancement sources; when OFF the new logic is compiled out entirely.
+  ace_engine_lite_enable_flex_layout_config = false
+  # When ON the engine compiles the SVG component bridge and depends on ui_lite SVG support.
+  ace_engine_lite_enable_svg_component_config = false
+  # When ON the engine compiles enhanced animation capabilities (transition/keyframes/path).
+  ace_engine_lite_enable_animation_capability = false
+  # When ON the engine compiles element transition (enter/exit/appear/disappear) support.
+  ace_engine_lite_enable_element_transition_capability = false
+  # When ON the engine compiles linear/radial gradient background support.
+  ace_engine_lite_enable_gradient_capability = false
+}
+
 ACE_LITE_PATH = "//foundation/arkui/ace_engine_lite/frameworks"
 ACE_LITE_COMMON_PATH = "//foundation/arkui/ace_engine_lite/frameworks/common"
 NATIVE_ENGINE_PATH =
@@ -22,6 +36,16 @@ MODULE_MANAGER_PATH =
 GRAPHIC_LITE_PATH = "//foundation/arkui/ui_lite"
 
 ace_lite_common_defines = []
+
+
+if (ace_engine_lite_enable_svg_component_config) {
+  # The ACE SVG bridge links against the ui_lite SVG implementation: both feature
+  # flags must be enabled together, otherwise the build fails with undefined
+  # references (or silently produces a non-functional component).
+  ace_lite_common_defines += [ "FEATURE_COMPONENT_SVG=1" ]
+} else {
+  ace_lite_common_defines += [ "FEATURE_COMPONENT_SVG=0" ]
+}
 
 if (!defined(global_parts_info) ||
     defined(global_parts_info.graphic_surface_lite)) {
@@ -258,3 +282,45 @@ ace_lite_sources = [
   "$ACE_LITE_PATH/src/core/wrapper/js.cpp",
   "$ACE_LITE_PATH/targets/platform_adapter.cpp",
 ]
+
+if (ace_engine_lite_enable_flex_layout_config) {
+  ace_lite_sources += [
+    "$ACE_LITE_PATH/src/core/components/component_flex.cpp",
+    "$ACE_LITE_PATH/src/core/components/flex_layout_utils.cpp",
+  ]
+}
+
+ace_lite_light_graphics_sources = []
+if (ace_engine_lite_enable_element_transition_capability) {
+  ace_lite_light_graphics_sources += [
+    "$ACE_LITE_PATH/src/core/animation/element_transition.cpp",
+    "$ACE_LITE_PATH/src/core/animation/transition_executor.cpp",
+    "$ACE_LITE_PATH/src/core/animation/transition_parser.cpp",
+  ]
+}
+if (ace_engine_lite_enable_animation_capability) {
+  ace_lite_light_graphics_sources += [
+    "$ACE_LITE_PATH/src/core/animation/keyframes_transition_impl.cpp",
+    "$ACE_LITE_PATH/src/core/components/component_animation.cpp",
+    "$ACE_LITE_PATH/src/core/stylemgr/app_style_path_parser.cpp",
+  ]
+}
+if (ace_engine_lite_enable_gradient_capability) {
+  ace_lite_light_graphics_sources += [
+    "$ACE_LITE_PATH/src/core/stylemgr/app_style_gradient_parser.cpp",
+    "$ACE_LITE_PATH/src/core/components/component_gradient.cpp",
+    ]
+}
+
+if (ace_engine_lite_enable_svg_component_config) {
+  ace_lite_include_dirs += [
+    "$GRAPHIC_LITE_PATH/interfaces/kits/svg",
+  ]
+  ace_lite_sources += [
+    "$ACE_LITE_PATH/src/core/components/component_svg.cpp",
+    "$ACE_LITE_PATH/src/core/components/svg_component.cpp",
+    "$ACE_LITE_PATH/src/core/components/svg_component_factory.cpp",
+    "$ACE_LITE_PATH/src/core/components/svg_component_utils.cpp",
+    "$ACE_LITE_PATH/src/core/components/svg_element_component.cpp",
+  ]
+}

@@ -17,6 +17,9 @@
 #include "ace_mem_base.h"
 #include "directive/descriptor_utils.h"
 #include "fatal_handler.h"
+#if FEATURE_TRANSITION_ANIMATOR
+#include "keyframes_transition_impl.h"
+#endif // FEATURE_TRANSITION_ANIMATOR
 #include "handler.h"
 #include "js_ability_impl.h"
 #include "js_app_context.h"
@@ -26,6 +29,9 @@
 #include "key_parser.h"
 #include "keys.h"
 #include "lazy_load_manager.h"
+#if (GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT == 1)
+#include <cstring>
+#endif // GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT
 #include "securec.h"
 #include "stylemgr/app_style.h"
 #include "stylemgr/app_style_manager.h"
@@ -39,8 +45,15 @@ static bool g_isAnimatorStarted = false;
 void Component::HandlerAnimations()
 {
     Component::AnimationsNode *point = g_animationListHead;
-    while (point != nullptr && point->transitionImpl != nullptr) {
-        point->transitionImpl->Start();
+    while (point != nullptr) {
+        if (point->transitionImpl != nullptr) {
+            point->transitionImpl->Start();
+        }
+#if FEATURE_TRANSITION_ANIMATOR
+        if (point->keyframesTransitionImpl != nullptr) {
+            point->keyframesTransitionImpl->Start();
+        }
+#endif
         point = point->next;
     }
     g_isAnimatorStarted = true;
@@ -55,6 +68,12 @@ void Component::ReleaseAnimations()
             delete (point->transitionImpl);
             point->transitionImpl = nullptr;
         }
+#if FEATURE_TRANSITION_ANIMATOR
+        if (point->keyframesTransitionImpl) {
+            delete (point->keyframesTransitionImpl);
+            point->keyframesTransitionImpl = nullptr;
+        }
+#endif
         delete (point);
         point = temp;
     }
@@ -82,6 +101,9 @@ Component::Component(jerry_value_t options, jerry_value_t children, AppStyleMana
       isAnimationKeyFramesSet_(false),
       curTransitionImpl_(nullptr),
       trans_(nullptr),
+#if FEATURE_ELEMENT_TRANSITION
+      elementTransState_(),
+#endif
       descriptors_(jerry_acquire_value(children)),
       watchersHead_(nullptr),
       height_(-1, DimensionType::TYPE_UNKNOWN),
@@ -93,13 +115,23 @@ Component::Component(jerry_value_t options, jerry_value_t children, AppStyleMana
       marginRight_(-1, DimensionType::TYPE_UNKNOWN),
       marginBottom_(-1, DimensionType::TYPE_UNKNOWN)
 {
-    JSValue attrs = JSObject::Get(options, ATTR_ATTRS);
-    if (JSUndefined::Is(attrs)) {
+#if (FEATURE_COMPONENT_SVG == 1)
+    // SVG elements without attributes (e.g. dynamic <g>) may be compiled as _c('g', children),
+    // leaving options as undefined. Reading attrs.freeze from undefined triggers a JerryScript assert.
+    if (JSUndefined::Is(options)) {
         freeze_ = false;
     } else {
-        freeze_ = JSObject::GetBoolean(attrs, ATTR_FREEZE);
+#endif
+        JSValue attrs = JSObject::Get(options, ATTR_ATTRS);
+        if (JSUndefined::Is(attrs)) {
+            freeze_ = false;
+        } else {
+            freeze_ = JSObject::GetBoolean(attrs, ATTR_FREEZE);
+        }
+        JSRelease(attrs);
+#if (FEATURE_COMPONENT_SVG == 1)
     }
-    JSRelease(attrs);
+#endif
     // create native element object before combining styles, as style data binding need it
     nativeElement_ = jerry_create_object();
     jerry_value_t global = jerry_get_global_object();
@@ -212,8 +244,17 @@ void Component::Release()
 
     // stop view animation
     if (curTransitionImpl_) {
+#if FEATURE_TRANSITION_ANIMATOR
+        StopAndReleaseCurrentTransition();
+#else
         curTransitionImpl_->Stop();
+#endif // FEATURE_TRANSITION_ANIMATOR
     }
+#if FEATURE_ELEMENT_TRANSITION
+    // Release transition-animation-specific resources (transStyle_/running transition) before
+    // native views are destroyed, so RestoreSnapshot() can safely access child views.
+    ElementTransition::Release(elementTransState_);
+#endif
     ReleaseViewExtraMsg();
     jerry_delete_object_native_pointer(nativeElement_, nullptr);
     // release all native views
@@ -389,6 +430,12 @@ const Dimension &Component::GetDimension(uint16_t keyNameId) const
             return top_;
         case K_LEFT:
             return left_;
+#if (GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT == 1)
+        case K_RIGHT:
+            return right_;
+        case K_BOTTOM:
+            return bottom_;
+#endif // GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT
         case K_MARGIN_TOP:
             return marginTop_;
         case K_MARGIN_BOTTOM:
@@ -443,6 +490,13 @@ void Component::ApplyAlignedMargin(UIView &uiView) const
     }
     if (marginLeft_.type == DimensionType::TYPE_PIXEL) {
         uiView.SetStyle(STYLE_MARGIN_LEFT, marginLeft_.value.pixel);
+#if (GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT == 1)
+        uiView.SetMarginLeftAuto(false);
+    } else if (marginLeft_.type == DimensionType::TYPE_AUTO) {
+        // clear the stale pixel margin, otherwise SetX would add it again on top of the auto margin
+        uiView.SetStyle(STYLE_MARGIN_LEFT, 0);
+        uiView.SetMarginLeftAuto(true);
+#endif // GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT
     }
     if (marginRight_.type == DimensionType::TYPE_PIXEL) {
         uiView.SetStyle(STYLE_MARGIN_RIGHT, marginRight_.value.pixel);
@@ -457,7 +511,11 @@ bool Component::IsLayoutRelatedAttrs(uint16_t attrKeyId) const
             attrKeyId == K_PADDING_RIGHT || attrKeyId == K_PADDING_TOP || attrKeyId == K_BORDER_BOTTOM_WIDTH ||
             attrKeyId == K_BORDER_LEFT_WIDTH || attrKeyId == K_BORDER_RIGHT_WIDTH || attrKeyId == K_BORDER_TOP_WIDTH ||
             attrKeyId == K_BORDER_WIDTH || attrKeyId == K_BORDER_RADIUS || attrKeyId == K_LEFT || attrKeyId == K_TOP ||
-            attrKeyId == K_SHOW || attrKeyId == K_DISPLAY);
+            attrKeyId == K_SHOW || attrKeyId == K_DISPLAY
+#if (GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT == 1)
+            || IsFlexLayoutAttr(attrKeyId)
+#endif // GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT
+            );
 }
 
 void Component::ApplyAlignedPosition(UIView &uiView) const
@@ -474,6 +532,19 @@ void Component::AdapteBoxRectArea(UIView &uiView) const
 {
     // set view height and width
     uint8_t borderNum = 2;
+#if (GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT == 1)
+    // Record whether the cross-axis sizes are explicitly specified by JS styles, so that
+    // FlexLayout can honor align-items: stretch only for children with auto cross size.
+    // Percent dimensions are also explicit (AlignDimensions converts them to pixels).
+    // Invalid pixel values (negative) are treated as auto to avoid blocking stretch.
+    bool heightExplicit = ((height_.type == DimensionType::TYPE_PIXEL) && (height_.value.pixel >= 0)) ||
+                          (height_.type == DimensionType::TYPE_PERCENT);
+    bool widthExplicit = ((width_.type == DimensionType::TYPE_PIXEL) && (width_.value.pixel >= 0)) ||
+                         (width_.type == DimensionType::TYPE_PERCENT);
+    uiView.SetHasExplicitHeight(heightExplicit);
+    uiView.SetHasExplicitWidth(widthExplicit);
+#endif // GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT
+
     int16_t height = (height_.type == DimensionType::TYPE_PIXEL) ? height_.value.pixel : -1;
     int16_t width = (width_.type == DimensionType::TYPE_PIXEL) ? width_.value.pixel : -1;
     if (height >= 0) {
@@ -539,6 +610,14 @@ bool Component::ApplyStyle(const AppStyleItem *style)
         return false;
     }
 
+#if FEATURE_ELEMENT_TRANSITION
+    // K_TRANSITION_EFFECT is our custom property, no other handler needs it
+    uint16_t styleNameId = GetStylePropNameId(style);
+    if (styleNameId == K_TRANSITION_EFFECT) {
+        ElementTransition::ApplyTransitionConfig(*this, style);
+        return true;
+    }
+#endif
     // Try private styles first
     bool applyResult = ApplyPrivateStyle(style);
     if (applyResult) {
@@ -606,7 +685,16 @@ bool Component::ApplyCommonStyle(UIView &view, const AppStyleItem *style)
             break;
         }
         case K_MARGIN_LEFT: {
+#if (GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT == 1)
+            const char *strValue = GetStyleStrValue(style);
+            if (strValue != nullptr && strcmp(strValue, "auto") == 0) {
+                marginLeft_.type = DimensionType::TYPE_AUTO;
+            } else {
+                GetDimensionFromStyle(marginLeft_, *style);
+            }
+#else
             GetDimensionFromStyle(marginLeft_, *style);
+#endif // GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT
             break;
         }
         case K_MARGIN_RIGHT: {
@@ -657,14 +745,48 @@ bool Component::ApplyCommonStyle(UIView &view, const AppStyleItem *style)
             SetBackgroundColor(view, *style);
             break;
         }
+#if (FEATURE_COMPONENT_GRADIENT == 1)
+        case K_BACKGROUND: {
+            HandleBackground(*style);
+            break;
+        }
+#endif //FEATURE_COMPONENT_GRADIENT
         case K_LEFT: {
             GetDimensionFromStyle(left_, *style);
+#if (GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT == 1)
+            if (left_.type == DimensionType::TYPE_PIXEL) {
+                view.SetFlexLeft(left_.value.pixel);
+            } else if (left_.type == DimensionType::TYPE_PERCENT) {
+                view.SetFlexLeftPercent(left_.value.percentage);
+            } else {
+                view.ClearFlexLeft();
+            }
+#endif // GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT
             break;
         }
         case K_TOP: {
             GetDimensionFromStyle(top_, *style);
+#if (GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT == 1)
+            if (top_.type == DimensionType::TYPE_PIXEL) {
+                view.SetFlexTop(top_.value.pixel);
+            } else if (top_.type == DimensionType::TYPE_PERCENT) {
+                view.SetFlexTopPercent(top_.value.percentage);
+            } else {
+                view.ClearFlexTop();
+            }
+#endif // GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT
             break;
         }
+#if (GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT == 1)
+        case K_RIGHT:
+        case K_BOTTOM:
+        case K_POSITION: {
+            if (!ApplyFlexPositionStyle(view, style, styleNameId)) {
+                return false;
+            }
+            break;
+        }
+#endif // GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT
         case K_ANIMATION_DURATION: {
             SetAnimationStyle(view, style, K_ANIMATION_DURATION);
             break;
@@ -689,10 +811,61 @@ bool Component::ApplyCommonStyle(UIView &view, const AppStyleItem *style)
             SetAnimationKeyFrames(view, style);
             break;
         }
+#if (GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT == 1)
+        case K_ALIGN_SELF: {
+            if (!SetAlignSelfStyle(view, style)) {
+                return false;
+            }
+            break;
+        }
+        case K_FLEX_GROW:
+        case K_FLEX_SHRINK: {
+            if (!SetFlexFactorStyle(view, style, styleNameId)) {
+                return false;
+            }
+            break;
+        }
+        case K_FLEX_BASIS: {
+            if (!SetFlexBasisStyle(view, style)) {
+                return false;
+            }
+            break;
+        }
+        case K_MIN_WIDTH:
+        case K_MAX_WIDTH:
+        case K_MIN_HEIGHT:
+        case K_MAX_HEIGHT: {
+            if (!SetMinMaxDimensionStyle(view, style, styleNameId)) {
+                return false;
+            }
+            break;
+        }
+        case K_ASPECT_RATIO: {
+            if (!SetAspectRatioStyle(view, style)) {
+                return false;
+            }
+            break;
+        }
+#endif // GRAPHIC_ENABLE_FLEX_LAYOUT_ENHANCEMENT
+#if FEATURE_PATH_ANIMATOR
+        case K_OFFSET_PATH:
+        case K_OFFSET_ROTATE: {
+            SetAnimationStyle(style, static_cast<int16_t>(styleNameId));
+            break;
+        }
+#endif // FEATURE_PATH_ANIMATOR
         case K_OPACITY: {
             SetOpacity(view, *style);
             break;
         }
+#if FEATURE_ELEMENT_TRANSITION
+        case K_TRANSITION_DURATION:
+        case K_TRANSITION_TIMING_FUNCTION:
+        case K_TRANSITION_DELAY: {
+            ElementTransition::ApplyTransitionConfig(*this, style);
+            break;
+        }
+#endif
         default: {
             return false;
         }
@@ -764,6 +937,12 @@ void Component::SetAnimationKeyFrames(const UIView &view, const AppStyleItem *st
         }
         SetAnimationKeyFrames(item);
     }
+
+#if FEATURE_TRANSITION_ANIMATOR
+    /* stage the animation-name into trans_: the plan is built later at record/start
+       time, when all animation-* styles have been applied */
+    StageKeyframesName(value);
+#endif // FEATURE_TRANSITION_ANIMATOR
 }
 
 void Component::SetAnimationKeyFrames(const AppStyleItem *item)
@@ -857,6 +1036,11 @@ void Component::SetAnimationKeyFrames(int16_t keyId, int32_t valueFrom, int32_t 
             trans_->opacity_to = valueTo;
             isAnimationKeyFramesSet_ = true;
             break;
+#if FEATURE_PATH_ANIMATOR
+        case K_OFFSET_DISTANCE:
+            SetOffsetDistanceKeyFrames(valueFrom, valueTo);
+            break;
+#endif // FEATURE_PATH_ANIMATOR
         default:
             break;
     }
@@ -907,7 +1091,6 @@ void Component::SetAnimationFillMode(const char *strValue, size_t strLen)
         HILOG_ERROR(HILOG_MODULE_ACE, "SetAnimationFillMode fail");
         return;
     }
-
     uint16_t animationFillKeyId = KeyParser::ParseKeyId(strValue, strLen);
     switch (animationFillKeyId) {
         case K_FORWARDS:
@@ -994,6 +1177,11 @@ void Component::SetAnimationStyle(const UIView &view, const AppStyleItem *styleI
         default:
             break;
     }
+#if FEATURE_TRANSITION_ANIMATOR
+    /* animation config changed: drop the built keyframes executor; it is rebuilt
+       from the staged name at record/start time with the fresh trans_ values */
+    DropKeyframesTransitionImpl();
+#endif // FEATURE_TRANSITION_ANIMATOR
 }
 
 void Component::AddAnimationToList(const TransitionImpl *transitionImpl) const
@@ -1008,8 +1196,25 @@ void Component::AddAnimationToList(const TransitionImpl *transitionImpl) const
     g_animationListHead = animation;
 }
 
+#if FEATURE_TRANSITION_ANIMATOR
+Component::AnimationsNode *&Component::AnimationListHeadRef()
+{
+    return g_animationListHead;
+}
+
+bool Component::IsAnimatorStarted()
+{
+    return g_isAnimatorStarted;
+}
+#endif // FEATURE_TRANSITION_ANIMATOR
+
 void Component::RecordAnimation()
 {
+#if FEATURE_TRANSITION_ANIMATOR
+    if (TryStartKeyframesTransition()) {
+        return;
+    }
+#endif // FEATURE_TRANSITION_ANIMATOR
     if (trans_ == nullptr) {
         return;
     }
@@ -1037,9 +1242,22 @@ void Component::RecordAnimation()
 
 void Component::StartAnimation()
 {
+#if FEATURE_TRANSITION_ANIMATOR
+    if (TryStartKeyframesTransition()) {
+        return;
+    }
+#endif // FEATURE_TRANSITION_ANIMATOR
     if (trans_ == nullptr) {
         return;
     }
+
+#if FEATURE_TRANSITION_ANIMATOR
+    if (trans_->iterations == 0) {
+        StopAndReleaseCurrentTransition();
+        isAnimationKeyFramesSet_ = false;
+        return;
+    }
+#endif // FEATURE_TRANSITION_ANIMATOR
 
     if (trans_->during > 0 && isAnimationKeyFramesSet_) {
         UIView *uiView = GetComponentRootView();
@@ -1063,6 +1281,9 @@ void Component::StartAnimation()
 
 void Component::ReleaseTransitionParam()
 {
+#if FEATURE_TRANSITION_ANIMATOR
+    ReleaseKeyframesTransitionImpl();
+#endif // FEATURE_TRANSITION_ANIMATOR
     if (trans_) {
         delete trans_;
         trans_ = nullptr;
@@ -1752,6 +1973,9 @@ void Component::AddChild(Component *childNode)
         childNode->SetParent(this);
         childNode->SetNextSibling(nullptr);
         childHead_ = childNode;
+#if (FEATURE_COMPONENT_GRADIENT == 1)
+        RecomputeGradientSubtreeFlag();
+#endif
         return;
     }
 
@@ -1767,6 +1991,9 @@ void Component::AddChild(Component *childNode)
     childNode->SetParent(this);
     temp->SetNextSibling(childNode);
     childNode->SetNextSibling(nullptr);
+#if (FEATURE_COMPONENT_GRADIENT == 1)
+    RecomputeGradientSubtreeFlag();
+#endif
 }
 
 void Component::RemoveChild(Component *childNode)
@@ -1774,6 +2001,13 @@ void Component::RemoveChild(Component *childNode)
     if ((childNode == nullptr) || (childHead_ == nullptr)) {
         return;
     }
+
+#if (FEATURE_COMPONENT_SVG == 1)
+    if (childNode->IsSvgComponent() || IsSvgComponent()) {
+        RemoveSvgChild(childNode);
+        return;
+    }
+#endif
 
     UIView *childNativeView = childNode->GetComponentRootView();
     UIViewGroup *parentView = reinterpret_cast<UIViewGroup *>(GetComponentRootView());
@@ -1788,6 +2022,9 @@ void Component::RemoveChild(Component *childNode)
         childNode->SetParent(nullptr);
         childHead_ = next;
         parentView->Remove(childNativeView);
+#if (FEATURE_COMPONENT_GRADIENT == 1)
+        RecomputeGradientSubtreeFlag();
+#endif
         return;
     }
 
@@ -1809,7 +2046,11 @@ void Component::RemoveChild(Component *childNode)
     childNode->SetNextSibling(nullptr);
     childNode->SetParent(nullptr);
     parentView->Remove(childNativeView);
+#if (FEATURE_COMPONENT_GRADIENT == 1)
+    RecomputeGradientSubtreeFlag();
+#endif
 }
+
 
 void Component::RemoveAllChildren()
 {
