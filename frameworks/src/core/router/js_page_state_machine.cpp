@@ -48,6 +48,9 @@ StateMachine::StateMachine()
     object_ = UNDEFINED;
     hasParams_ = false;
     isEntireHidden_ = false;
+#ifdef ENABLE_PAGE_TRANSITION_EFFECT
+    releasedAfterTransition_ = false;
+#endif
     watchersHead_ = nullptr;
     scrollLayer_ = nullptr;
 }
@@ -463,6 +466,19 @@ void StateMachine::ReleaseHistoryPageResource()
         rootComponent_ = nullptr;
     }
 
+#ifdef ENABLE_PAGE_TRANSITION_EFFECT
+    // a page replaced during a transition must leave the process-wide bindings and the app
+    // context managers to the page that replaced it, which still holds them. Its component
+    // animations went away with its components above, so Component::ReleaseAnimations() - which
+    // releases the animations of every page, including the live ones - is correctly skipped here
+    if (releasedAfterTransition_) {
+        // this page's own view model handle goes back either way
+        jerry_release_value(viewModel_);
+        viewModel_ = UNDEFINED;
+        return;
+    }
+#endif
+
     ReleaseRootObject();
 
     // release current page's viewModel js object
@@ -505,6 +521,26 @@ void StateMachine::SetHiddenFlag(bool flag)
 {
     isEntireHidden_ = flag;
 }
+
+#ifdef ENABLE_PAGE_TRANSITION_EFFECT
+void StateMachine::ReleaseProcessWideBindings()
+{
+    // On master this hands the process-wide binding slots over from a page that a transition kept
+    // alive but that is no longer their owner; the only such slot is the digital crown monitor.
+    // This branch has no crown module, so there is nothing to hand over.
+    HILOG_DEBUG(HILOG_MODULE_ACE, "no process-wide binding to release for the replaced page");
+}
+
+void StateMachine::SetReleasedAfterTransition(bool released)
+{
+    releasedAfterTransition_ = released;
+}
+
+UIView *StateMachine::GetPageRootView() const
+{
+    return (scrollLayer_ != nullptr) ? scrollLayer_->GetPageRootView() : nullptr;
+}
+#endif
 
 #ifdef TDD_ASSERTIONS
 void StateMachine::SetViewModel(jerry_value_t viewModel)
